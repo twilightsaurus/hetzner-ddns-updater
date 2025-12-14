@@ -26,11 +26,20 @@ fi
 umask 077
 
 LOCK_DIR="/tmp/run-update.lock"
+SET_RULES_RESP_FILE=""
+
+cleanup() {
+  rmdir "$LOCK_DIR" 2>/dev/null || true
+  if [ -n "${SET_RULES_RESP_FILE:-}" ]; then
+    rm -f "$SET_RULES_RESP_FILE" 2>/dev/null || true
+  fi
+}
+
 if ! mkdir "$LOCK_DIR" 2>/dev/null; then
   echo "Another run is in progress; exiting"
   exit 0
 fi
-trap 'rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
+trap 'cleanup' EXIT
 
 if [ -z "$HETZNER_API_TOKEN" ] || [ -z "$FIREWALL_ID" ] || [ -z "$DDNS_HOSTNAME" ]; then
   echo "Missing required env vars: HETZNER_API_TOKEN, FIREWALL_ID, DDNS_HOSTNAME"
@@ -81,11 +90,19 @@ else
 fi
 
 if [ "$OLD_IP" = "$NEW_IP" ]; then
-  echo "IP unchanged: $NEW_IP"
+  if [ "$TCP_PORTS" = "${TCP_PORTS% *}" ]; then
+    echo "IP unchanged for port $TCP_PORTS: $NEW_IP"
+  else
+    echo "IP unchanged for ports $TCP_PORTS: $NEW_IP"
+  fi
   exit 0
 fi
 
-echo "IP changed: $OLD_IP -> $NEW_IP"
+if [ "$TCP_PORTS" = "${TCP_PORTS% *}" ]; then
+  echo "IP changed for port $TCP_PORTS: $OLD_IP -> $NEW_IP"
+else
+  echo "IP changed for ports $TCP_PORTS: $OLD_IP -> $NEW_IP"
+fi
 
 # Fetch current firewall configuration
 FIREWALL_JSON="$(curl -fsS \
@@ -165,7 +182,9 @@ UPDATED_RULES="$(echo "$UPDATE_PLAN" | jq -c '.rules')"
 # Push updated rules back to Hetzner (returns an async Action)
 PAYLOAD="$(jq -cn --argjson rules "$UPDATED_RULES" '{rules: $rules}')"
 
-SET_RULES_RESPONSE="$(curl -fsS -X POST \
+SET_RULES_RESP_FILE="$(mktemp)"
+
+HTTP_CODE="$(curl -sS -X POST \
   --connect-timeout 5 \
   --max-time 20 \
   --retry 3 \
@@ -173,13 +192,39 @@ SET_RULES_RESPONSE="$(curl -fsS -X POST \
   -H "Authorization: Bearer ${HETZNER_API_TOKEN}" \
   -H "Content-Type: application/json" \
   -d "$PAYLOAD" \
+  -o "$SET_RULES_RESP_FILE" \
+  -w '%{http_code}' \
   "https://api.hetzner.cloud/v1/firewalls/${FIREWALL_ID}/actions/set_rules")"
 
-ACTION_ID="$(echo "$SET_RULES_RESPONSE" | jq -r '.action.id // empty')"
-ACTION_STATUS="$(echo "$SET_RULES_RESPONSE" | jq -r '.action.status // empty')"
+SET_RULES_RESPONSE="$(cat "$SET_RULES_RESP_FILE")"
+
+case "$HTTP_CODE" in
+  2??) : ;;
+  *)
+    echo "Hetzner set_rules failed (HTTP $HTTP_CODE)"
+    if [ -n "$SET_RULES_RESPONSE" ]; then
+      echo "Response body:"
+      echo "$SET_RULES_RESPONSE"
+    fi
+    exit 1
+    ;;
+esac
+
+if ! echo "$SET_RULES_RESPONSE" | jq -e . >/dev/null 2>&1; then
+  echo "Hetzner set_rules returned non-JSON (HTTP $HTTP_CODE)"
+  if [ -n "$SET_RULES_RESPONSE" ]; then
+    echo "Response body:"
+    echo "$SET_RULES_RESPONSE"
+  fi
+  exit 1
+fi
+
+ACTION_ID="$(echo "$SET_RULES_RESPONSE" | jq -r '(.action.id // .actions[0].id // empty)')"
+ACTION_STATUS="$(echo "$SET_RULES_RESPONSE" | jq -r '(.action.status // .actions[0].status // empty)')"
 
 if [ -z "$ACTION_ID" ]; then
-  echo "Unexpected response from set_rules (missing .action.id)"
+  echo "Unexpected response from set_rules (missing action id) (HTTP $HTTP_CODE)"
+  echo "$SET_RULES_RESPONSE" | jq -c . 2>/dev/null || true
   exit 1
 fi
 

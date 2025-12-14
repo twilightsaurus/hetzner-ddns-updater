@@ -92,8 +92,12 @@ High-level: deploy this repo as a Dockerfile-based app, set the env vars as secr
 
 3. **Add persistent storage**
 
-- Add a **volume** and mount it to **`/state`** inside the container.
+- In Coolify, go to **Persistent Storage** and add a **Directory mount**.
+  - **Source Path (host directory)**: e.g. `/data/coolify/volumes/hetzner-ddns-updater/state`
+  - **Destination Path (container)**: `/state`
   - This keeps `/state/ip.txt` across restarts so the updater stays idempotent.
+
+Note: Coolify’s **Volume mount** and **Directory mount** are different concepts in the UI. For this project you want a **Directory mount** because `/state` is a directory path inside the container.
 
 4. **Networking**
 
